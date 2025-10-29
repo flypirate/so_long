@@ -1,0 +1,1082 @@
+!<arch>
+mlx_cursor.c/   0           0     0     644     1949      `
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        ::::::::            */
+/*   mlx_cursor.c                                       :+:    :+:            */
+/*                                                     +:+                    */
+/*   By: W2Wizard <main@w2wizard.dev>                 +#+                     */
+/*                                                   +#+                      */
+/*   Created: 2022/01/18 20:10:54 by W2Wizard      #+#    #+#                 */
+/*   Updated: 2023/03/09 11:11:45 by W2Wizard      ########   odam.nl         */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include "MLX42/MLX42_Int.h"
+
+//= Public =//
+
+mlx_win_cursor_t* mlx_create_std_cursor(cursor_t type)
+{
+	MLX_ASSERT(type >= MLX_CURSOR_ARROW && type < MLX_CURSOR_VRESIZE, "Invalid standard cursor type");
+
+	GLFWcursor* cursor;
+	if ((cursor = glfwCreateStandardCursor(type)))
+		return (cursor);
+	return ((void *)mlx_error(MLX_MEMFAIL));
+}
+
+mlx_win_cursor_t* mlx_create_cursor(mlx_texture_t* texture)
+{
+	MLX_NONNULL(texture);
+
+	GLFWcursor* cursor;
+	GLFWimage image = (GLFWimage) {
+		.width = texture->width,
+		.height = texture->height,
+		.pixels = texture->pixels
+	};
+
+	if ((cursor = glfwCreateCursor(&image, 0, 0)))
+		return (cursor);
+	return ((void *)mlx_error(MLX_MEMFAIL));
+}
+
+void mlx_destroy_cursor(mlx_win_cursor_t* cursor)
+{
+	MLX_NONNULL(cursor);
+
+	glfwDestroyCursor(cursor);
+}
+
+void mlx_set_cursor(mlx_t* mlx, mlx_win_cursor_t* cursor)
+{
+	MLX_NONNULL(mlx);
+	MLX_NONNULL(cursor);
+
+	glfwSetCursor(mlx->window, cursor);
+}
+
+void mlx_set_cursor_mode(mlx_t* mlx, mouse_mode_t mode)
+{
+	MLX_NONNULL(mlx);
+
+	glfwSetInputMode(mlx->window, GLFW_CURSOR, mode);
+}
+
+mlx_exit.c/     0           0     0     644     1746      `
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        ::::::::            */
+/*   mlx_exit.c                                         :+:    :+:            */
+/*                                                     +:+                    */
+/*   By: W2Wizard <main@w2wizard.dev>                 +#+                     */
+/*                                                   +#+                      */
+/*   Created: 2021/12/28 02:43:22 by W2Wizard      #+#    #+#                 */
+/*   Updated: 2023/06/08 18:12:20 by XEDGit        ########   odam.nl         */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include "MLX42/MLX42_Int.h"
+
+//= Private =//
+
+static void mlx_free_image(void* content)
+{
+	mlx_image_t* img = content;
+
+	mlx_freen(4, img->context, img->pixels, img->instances, img);
+}
+
+//= Public =//
+
+void mlx_close_window(mlx_t* mlx)
+{
+	MLX_NONNULL(mlx);
+	glfwSetWindowShouldClose(mlx->window, true);
+}
+
+/**
+ * All of glfw & glads resources are cleaned up by the terminate function.
+ * Now it's time to clean up our own mess.
+ */
+void mlx_terminate(mlx_t* mlx)
+{
+	MLX_NONNULL(mlx);
+
+	mlx_ctx_t *const mlxctx = mlx->context;
+
+	glUseProgram(0);
+	glLinkProgram(mlxctx->shaderprogram);
+	glDeleteProgram(mlxctx->shaderprogram);
+	glfwTerminate();
+	mlx_lstclear((mlx_list_t**)(&mlxctx->hooks), &free);
+	mlx_lstclear((mlx_list_t**)(&mlxctx->render_queue), &free);
+	mlx_lstclear((mlx_list_t**)(&mlxctx->images), &mlx_free_image);
+	mlx_freen(2, mlxctx, mlx);
+}
+mlx_images.c/   0           0     0     644     7742      `
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        ::::::::            */
+/*   mlx_images.c                                       :+:    :+:            */
+/*                                                     +:+                    */
+/*   By: W2Wizard <main@w2wizard.dev>                 +#+                     */
+/*                                                   +#+                      */
+/*   Created: 2021/12/28 02:29:06 by W2Wizard      #+#    #+#                 */
+/*   Updated: 2023/03/30 16:36:39 by ntamayo-      ########   odam.nl         */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include "MLX42/MLX42_Int.h"
+
+//= Private =//
+
+void mlx_flush_batch(mlx_ctx_t* mlx)
+{
+	if (mlx->batch_size <= 0)
+		return;
+
+	glBindBuffer(GL_ARRAY_BUFFER, mlx->vbo);
+	glBufferData(GL_ARRAY_BUFFER, mlx->batch_size * sizeof(vertex_t), mlx->batch_vertices, GL_STATIC_DRAW);
+	glDrawArrays(GL_TRIANGLES, 0, mlx->batch_size);
+
+	mlx->batch_size = 0;
+	memset(mlx->bound_textures, 0, sizeof(mlx->bound_textures));
+}
+
+static int8_t mlx_bind_texture(mlx_ctx_t* mlx, mlx_image_t* img)
+{
+	const GLint handle = (GLint)((mlx_image_ctx_t*)img->context)->texture;
+
+	// Attempt to bind the texture, or obtain the index if it is already bound.
+	for (int8_t i = 0; i < 16; i++)
+	{
+		if (mlx->bound_textures[i] == handle)
+			return (i);
+
+		if (mlx->bound_textures[i] == 0)
+		{
+			mlx->bound_textures[i] = handle;
+
+			glActiveTexture(GL_TEXTURE0 + i);
+			glBindTexture(GL_TEXTURE_2D, handle);
+			return (i);
+		}
+	}
+
+	// If no free slot was found, flush the batch and assign the texture to the first available slot
+	mlx_flush_batch(mlx);
+
+	mlx->bound_textures[0] = handle;
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, handle);
+	return (0);
+}
+
+/**
+ * Internal function to draw a single instance of an image
+ * to the screen.
+ */
+void mlx_draw_instance(mlx_ctx_t* mlx, mlx_image_t* img, mlx_instance_t* instance)
+{
+	float w = (float) img->width;
+	float h = (float) img->height;
+	float x = (float) instance->x;
+	float y = (float) instance->y;
+	float z = (float) instance->z;
+	int8_t tex = mlx_bind_texture(mlx, img);
+
+	vertex_t vertices[6] = {
+			(vertex_t){x, y, z, 0.f, 0.f, tex},
+			(vertex_t){x + w, y + h, z, 1.f, 1.f, tex},
+			(vertex_t){x + w, y, z, 1.f, 0.f, tex},
+			(vertex_t){x, y, z, 0.f, 0.f, tex},
+			(vertex_t){x, y + h, z, 0.f, 1.f, tex},
+			(vertex_t){x + w, y + h, z, 1.f, 1.f, tex},
+	};
+	memmove(mlx->batch_vertices + mlx->batch_size, vertices, sizeof(vertices));
+	mlx->batch_size += 6;
+
+	if (mlx->batch_size >= MLX_BATCH_SIZE)
+		mlx_flush_batch(mlx);
+}
+
+mlx_instance_t* mlx_grow_instances(mlx_image_t* img, bool* did_realloc)
+{
+	mlx_image_ctx_t* const ctx = img->context;
+	if (img->count >= ctx->instances_capacity)
+	{
+		if (ctx->instances_capacity == 0)
+			ctx->instances_capacity = img->count;
+		else
+			ctx->instances_capacity *= 2;
+		*did_realloc = true;
+		return realloc(img->instances, ctx->instances_capacity * sizeof(mlx_instance_t));
+	}
+	*did_realloc = false;
+	return img->instances;
+}
+
+//= Public =//
+
+void mlx_set_instance_depth(mlx_instance_t* instance, int32_t zdepth)
+{
+	MLX_NONNULL(instance);
+
+	if (instance->z == zdepth)
+		return;
+	instance->z = zdepth;
+
+	/**
+	 * NOTE: The reason why we don't sort directly is that
+	 * the user might call this function multiple times in a row and we don't
+	 * want to sort for every change. Pre-loop wise that is.
+	 */
+	sort_queue = true;
+}
+
+int32_t mlx_image_to_window(mlx_t* mlx, mlx_image_t* img, int32_t x, int32_t y)
+{
+	MLX_NONNULL(mlx);
+	MLX_NONNULL(img);
+
+	// Allocate buffers...
+	img->count++;
+	bool did_realloc;
+	mlx_instance_t* instances = mlx_grow_instances(img, &did_realloc);
+	draw_queue_t* queue = calloc(1, sizeof(draw_queue_t));
+	if (!instances || !queue)
+	{
+		if (did_realloc)
+			free(instances);
+		return (free(queue), mlx_error(MLX_MEMFAIL), -1);
+	}
+
+	// Set data...
+	queue->image = img;
+	int32_t index = queue->instanceid = img->count - 1;
+	img->instances = instances;
+	img->instances[index].x = x;
+	img->instances[index].y = y;
+
+	// NOTE: We keep updating the Z for the convenience of the user.
+	// Always update Z depth to prevent overlapping images by default.
+	img->instances[index].z = ((mlx_ctx_t*)mlx->context)->zdepth++;
+	img->instances[index].enabled = true;
+
+	// Add draw call...
+	sort_queue = true;
+	mlx_list_t* templst;
+	if ((templst = mlx_lstnew(queue)))
+	{
+		mlx_lstadd_front(&((mlx_ctx_t*)mlx->context)->render_queue, templst);
+		return (index);
+	}
+	return (mlx_freen(2, instances, queue), mlx_error(MLX_MEMFAIL), -1);
+}
+
+mlx_image_t* mlx_new_image(mlx_t* mlx, uint32_t width, uint32_t height)
+{
+	MLX_NONNULL(mlx);
+
+	if (!width || !height || width > INT16_MAX || height > INT16_MAX)
+		return ((void*)mlx_error(MLX_INVDIM));
+
+	const mlx_ctx_t* mlxctx = mlx->context;
+	mlx_image_t* newimg = calloc(1, sizeof(mlx_image_t));
+	mlx_image_ctx_t* newctx = calloc(1, sizeof(mlx_image_ctx_t));
+	if (!newimg || !newctx)
+	{
+		mlx_freen(2, newimg, newctx);
+		return ((void *)mlx_error(MLX_MEMFAIL));
+	}
+	newimg->enabled = true;
+	newimg->context = newctx;
+	(*(uint32_t*)&newimg->width) = width;
+	(*(uint32_t*)&newimg->height) = height;
+	if (!(newimg->pixels = calloc(width * height, sizeof(int32_t))))
+	{
+		mlx_freen(2, newimg, newctx);
+		return ((void *)mlx_error(MLX_MEMFAIL));
+	}
+
+	mlx_list_t* newentry;
+	if (!(newentry = mlx_lstnew(newimg)))
+	{
+		mlx_freen(3, newimg->pixels, newimg->context, newimg);
+		return ((void *)mlx_error(MLX_MEMFAIL));
+	}
+
+	// Generate OpenGL texture
+	glGenTextures(1, &newctx->texture);
+	glBindTexture(GL_TEXTURE_2D, newctx->texture);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	mlx_lstadd_front((mlx_list_t**)(&mlxctx->images), newentry);
+	return (newimg);
+}
+
+void mlx_delete_image(mlx_t* mlx, mlx_image_t* image)
+{
+	MLX_NONNULL(mlx);
+	MLX_NONNULL(image);
+
+	mlx_ctx_t* mlxctx = mlx->context;
+
+	// Delete all instances in the render queue
+	mlx_list_t* quelst;
+	while ((quelst = mlx_lstremove(&mlxctx->render_queue, image, &mlx_equal_inst)))
+		mlx_freen(2, quelst->content, quelst);
+
+	mlx_list_t* imglst;
+	if ((imglst = mlx_lstremove(&mlxctx->images, image, &mlx_equal_image)))
+	{
+		glDeleteTextures(1, &((mlx_image_ctx_t*)image->context)->texture);
+		mlx_freen(5, image->pixels, image->instances, image->context, imglst, image);
+	}
+}
+
+bool mlx_resize_image(mlx_image_t* img, uint32_t nwidth, uint32_t nheight)
+{
+	MLX_NONNULL(img);
+
+	if (!nwidth || !nheight || nwidth > INT16_MAX || nheight > INT16_MAX)
+		return (mlx_error(MLX_INVDIM));
+	if (nwidth != img->width || nheight != img->height)
+	{
+		uint32_t* origin = (uint32_t*)img->pixels;
+		float wstep = (float)img->width / nwidth;
+		float hstep = (float)img->height / nheight;
+
+		uint8_t* tempbuff = calloc(nwidth * nheight, BPP);
+		if (!tempbuff)
+			return (mlx_error(MLX_MEMFAIL));
+		img->pixels = tempbuff;
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, nwidth, nheight, 0, GL_RGBA, GL_UNSIGNED_BYTE, img->pixels);
+
+		uint32_t* destin = (uint32_t*)img->pixels;
+		for (uint32_t j = 0; j < nheight; j++)
+			for (uint32_t i = 0; i < nwidth; i++)
+				destin[j * nwidth + i] = origin[(uint32_t)(j * hstep) * img->width + (uint32_t)(i * wstep)];
+		(*(uint32_t*)&img->width) = nwidth;
+		(*(uint32_t*)&img->height) = nheight;
+		free(origin);
+	}
+	return (true);
+}
+mlx_init.c/     0           0     0     644     7976      `
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        ::::::::            */
+/*   mlx_init.c                                         :+:    :+:            */
+/*                                                     +:+                    */
+/*   By: W2Wizard <main@w2wizard.dev>                 +#+                     */
+/*                                                   +#+                      */
+/*   Created: 2021/12/28 00:24:30 by W2Wizard      #+#    #+#                 */
+/*   Updated: 2023/06/08 18:16:19 by XEDGit        ########   odam.nl         */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include "MLX42/MLX42_Int.h"
+
+//= Private =//
+
+static void framebuffer_callback(GLFWwindow *window, int width, int height)
+{
+	(void)window;
+	glViewport(0, 0, width, height);
+}
+
+static bool mlx_create_buffers(mlx_t* mlx)
+{
+	mlx_ctx_t* mlxctx = mlx->context;
+
+	mlxctx->zdepth = 0;
+	glActiveTexture(GL_TEXTURE0);
+	glGenVertexArrays(1, &(mlxctx->vao));
+	glGenBuffers(1, &(mlxctx->vbo));
+	glBindVertexArray(mlxctx->vao);
+	glBindBuffer(GL_ARRAY_BUFFER, mlxctx->vbo);
+
+	// Vertex XYZ coordinates
+	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(vertex_t), NULL);
+	glEnableVertexAttribArray(0);
+
+	// UV Coordinates
+	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(vertex_t), (void *)(sizeof(float) * 3));
+	glEnableVertexAttribArray(1);
+
+	// Texture index
+	glVertexAttribIPointer(2, 1, GL_BYTE, sizeof(vertex_t), (void *)(sizeof(float) * 5));
+	glEnableVertexAttribArray(2);
+
+	glEnable(GL_BLEND);
+	glEnable(GL_DEPTH_TEST);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+	glUniform1i(glGetUniformLocation(mlxctx->shaderprogram, "Texture0"), 0);
+	glUniform1i(glGetUniformLocation(mlxctx->shaderprogram, "Texture1"), 1);
+	glUniform1i(glGetUniformLocation(mlxctx->shaderprogram, "Texture2"), 2);
+	glUniform1i(glGetUniformLocation(mlxctx->shaderprogram, "Texture3"), 3);
+	glUniform1i(glGetUniformLocation(mlxctx->shaderprogram, "Texture4"), 4);
+	glUniform1i(glGetUniformLocation(mlxctx->shaderprogram, "Texture5"), 5);
+	glUniform1i(glGetUniformLocation(mlxctx->shaderprogram, "Texture6"), 6);
+	glUniform1i(glGetUniformLocation(mlxctx->shaderprogram, "Texture7"), 7);
+	glUniform1i(glGetUniformLocation(mlxctx->shaderprogram, "Texture8"), 8);
+	glUniform1i(glGetUniformLocation(mlxctx->shaderprogram, "Texture9"), 9);
+	glUniform1i(glGetUniformLocation(mlxctx->shaderprogram, "Texture10"), 10);
+	glUniform1i(glGetUniformLocation(mlxctx->shaderprogram, "Texture11"), 11);
+	glUniform1i(glGetUniformLocation(mlxctx->shaderprogram, "Texture12"), 12);
+	glUniform1i(glGetUniformLocation(mlxctx->shaderprogram, "Texture13"), 13);
+	glUniform1i(glGetUniformLocation(mlxctx->shaderprogram, "Texture14"), 14);
+	glUniform1i(glGetUniformLocation(mlxctx->shaderprogram, "Texture15"), 15);
+
+	return (true);
+}
+
+/**
+ * Compiles the given shader source code of a given shader type.
+ * Returns shader object via param.
+ *
+ * @param code The shader source code.
+ * @param Type GL_VERTEX_SHADER, GL_FRAGMENT_SHADER, GL_GEOMETRY_SHADER, ...
+ * @return Non-zero on success, else 0.
+ */
+static uint32_t mlx_compile_shader(const char* code, int32_t type)
+{
+	GLuint shader;
+	int32_t success;
+	char infolog[512] = {0};
+
+	if (!code || (shader = glCreateShader(type)) == 0)
+		return (0);
+
+	GLint len = strlen(code);
+	glShaderSource(shader, 1, &code, &len);
+	glCompileShader(shader);
+	glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+	if (!success)
+	{
+		glGetShaderInfoLog(shader, sizeof(infolog), NULL, infolog);
+		fprintf(stderr, "%s", infolog);
+		glDeleteShader(shader);
+		return (0);
+	}
+	return (shader);
+}
+
+static bool mlx_init_render(mlx_t* mlx)
+{
+    uint32_t vshader = 0;
+    uint32_t fshader = 0;
+    char infolog[512] = {0};
+    mlx_ctx_t* mlxctx = mlx->context;
+
+    glfwMakeContextCurrent(mlx->window);
+    glfwSetFramebufferSizeCallback(mlx->window, framebuffer_callback);
+    glfwSetWindowUserPointer(mlx->window, mlx);
+    glfwSwapInterval(MLX_SWAP_INTERVAL);
+
+    // Load all OpenGL function pointers
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
+        return (mlx_error(MLX_GLADFAIL));
+    if (!(vshader = mlx_compile_shader(vert_shader, GL_VERTEX_SHADER)))
+        return (mlx_error(MLX_VERTFAIL));
+    if (!(fshader = mlx_compile_shader(frag_shader, GL_FRAGMENT_SHADER)))
+        return (mlx_error(MLX_FRAGFAIL));;
+    if (!(mlxctx->shaderprogram = glCreateProgram()))
+    {
+        glDeleteShader(fshader);
+        glDeleteShader(vshader);
+        return (mlx_error(MLX_SHDRFAIL));
+    }
+    glAttachShader(mlxctx->shaderprogram, vshader);
+    glAttachShader(mlxctx->shaderprogram, fshader);
+    glLinkProgram(mlxctx->shaderprogram);
+
+    int32_t success;
+    glGetProgramiv(mlxctx->shaderprogram, GL_LINK_STATUS, &success);
+    if (!success)
+    {
+        glGetProgramInfoLog(mlxctx->shaderprogram, sizeof(infolog), NULL, infolog);
+        fprintf(stderr, "%s", infolog);
+        glDeleteProgram(mlxctx->shaderprogram);
+        glDeleteShader(vshader);
+        glDeleteShader(fshader);
+        return (mlx_error(MLX_SHDRFAIL));
+    }
+
+    // Detach shaders after linking but before deleting them
+    glDetachShader(mlxctx->shaderprogram, vshader);
+    glDetachShader(mlxctx->shaderprogram, fshader);
+
+    // Delete shaders
+    glDeleteShader(vshader);
+    glDeleteShader(fshader);
+    glUseProgram(mlxctx->shaderprogram);
+    for (size_t i = 0; i < 16; i++)
+        mlxctx->bound_textures[i] = 0;
+    return (true);
+}
+
+//= Public =//
+
+// NOTE: https://www.glfw.org/docs/3.3/group__window.html
+
+// Default settings
+int32_t mlx_settings[MLX_SETTINGS_MAX] = {false, false, false, true, false};
+mlx_errno_t mlx_errno = MLX_SUCCESS;
+bool sort_queue = false;
+
+mlx_t* mlx_init(int32_t width, int32_t height, const char* title, bool resize)
+{
+	MLX_NONNULL(title);
+	MLX_ASSERT(width > 0, "Window width must be positive");
+	MLX_ASSERT(height > 0, "Window height must be positive");
+
+	bool init;
+	mlx_t* mlx;
+	if (!(init = glfwInit()))
+		return ((void*)mlx_error(MLX_GLFWFAIL));
+	if (!(mlx = calloc(1, sizeof(mlx_t))))
+		return ((void*)mlx_error(MLX_MEMFAIL));
+	if (!(mlx->context = calloc(1, sizeof(mlx_ctx_t))))
+		return (free(mlx), (void*)mlx_error(MLX_MEMFAIL));
+
+	mlx_ctx_t* const mlxctx = mlx->context;
+    mlx->window = NULL;
+	mlx->width = width;
+	mlx->height = height;
+	mlxctx->initialWidth = width;
+	mlxctx->initialHeight = height;
+
+	// NOTE(W2): For emscripten, this value will be ignored anyway.
+	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#ifdef EMSCRIPTEN
+	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+	glfwWindowHint(GLFW_DECORATED, GLFW_TRUE);
+	glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
+	glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
+#else
+	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+	glfwWindowHint(GLFW_MAXIMIZED, mlx_settings[MLX_MAXIMIZED]);
+	glfwWindowHint(GLFW_DECORATED, mlx_settings[MLX_DECORATED]);
+	glfwWindowHint(GLFW_VISIBLE, !mlx_settings[MLX_HEADLESS]);
+#endif
+#ifdef __APPLE__
+	glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+#endif
+	glfwWindowHint(GLFW_RESIZABLE, resize ? GLFW_TRUE : GLFW_FALSE);
+	if (!(mlx->window = glfwCreateWindow(width, height, title, mlx_settings[MLX_FULLSCREEN] ? glfwGetPrimaryMonitor() : NULL, NULL)))
+		return (glfwTerminate(), (void*)mlx_error(MLX_WINFAIL));
+	if (!mlx_init_render(mlx) || !mlx_create_buffers(mlx))
+		return (mlx_terminate(mlx), NULL);
+    glfwMakeContextCurrent(mlx->window);
+	return (mlx);
+}
+
+void mlx_set_setting(mlx_settings_t setting, int32_t value)
+{
+	MLX_ASSERT(setting >= 0 && setting < MLX_SETTINGS_MAX, "Invalid settings value");
+	mlx_settings[setting] = value;
+}
+mlx_keys.c/     0           0     0     644     1699      `
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        ::::::::            */
+/*   mlx_keys.c                                         :+:    :+:            */
+/*                                                     +:+                    */
+/*   By: W2Wizard <main@w2wizard.dev>                 +#+                     */
+/*                                                   +#+                      */
+/*   Created: 2022/01/01 21:06:45 by W2Wizard      #+#    #+#                 */
+/*   Updated: 2023/02/13 12:24:40 by W2Wizard      ########   odam.nl         */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include "MLX42/MLX42_Int.h"
+
+//= Private =//
+
+static void mlx_key_callback(GLFWwindow* window, int32_t key, int32_t scancode, int32_t action, int32_t mods)
+{
+	const mlx_t* mlx = glfwGetWindowUserPointer(window);
+	const mlx_key_t key_hook = ((mlx_ctx_t*)mlx->context)->key_hook;
+	const mlx_key_data_t callback_data = {
+		key,
+		action,
+		scancode,
+		mods,
+	};
+
+	key_hook.func(callback_data, key_hook.param);
+}
+
+//= Public =//
+
+void mlx_key_hook(mlx_t* mlx, mlx_keyfunc func, void* param)
+{
+	MLX_NONNULL(mlx);
+	MLX_NONNULL(func);
+
+	mlx_ctx_t* mlxctx = mlx->context;
+	mlxctx->key_hook.func = func;
+	mlxctx->key_hook.param = param;
+	glfwSetKeyCallback(mlx->window, mlx_key_callback);
+}
+
+bool mlx_is_key_down(mlx_t* mlx, keys_t key)
+{
+	MLX_NONNULL(mlx);
+
+	return (glfwGetKey(mlx->window, key) == GLFW_PRESS);
+}
+
+mlx_loop.c/     0           0     0     644     3542      `
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        ::::::::            */
+/*   mlx_loop.c                                         :+:    :+:            */
+/*                                                     +:+                    */
+/*   By: W2Wizard <main@w2wizard.dev>                 +#+                     */
+/*                                                   +#+                      */
+/*   Created: 2021/12/28 01:24:36 by W2Wizard      #+#    #+#                 */
+/*   Updated: 2023/03/28 16:34:17 by W2Wizard      ########   odam.nl         */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include "MLX42/MLX42_Int.h"
+
+//= Private =//
+
+static void mlx_exec_loop_hooks(mlx_t* mlx)
+{
+	const mlx_ctx_t* mlxctx = mlx->context;
+
+	mlx_list_t* lstcpy = mlxctx->hooks;
+	while (lstcpy && !glfwWindowShouldClose(mlx->window))
+	{
+		mlx_hook_t* hook = ((mlx_hook_t*)lstcpy->content);
+		hook->func(hook->param);
+		lstcpy = lstcpy->next;
+	}
+}
+
+static void mlx_render_images(mlx_t* mlx)
+{
+	mlx_ctx_t* mlxctx = mlx->context;
+	mlx_list_t* imglst = mlxctx->images;
+
+	if (sort_queue)
+	{
+		sort_queue = false;
+		mlx_sort_renderqueue(&mlxctx->render_queue);
+	}
+
+	// Upload image textures to GPU
+	while (imglst)
+	{
+		mlx_image_t* image;
+		if (!(image = imglst->content)) {
+			mlx_error(MLX_INVIMG);
+			return;
+		}
+
+		glBindTexture(GL_TEXTURE_2D, ((mlx_image_ctx_t*)image->context)->texture);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, image->width, image->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, image->pixels);
+		imglst = imglst->next;
+	}
+
+	// Execute draw calls
+	mlx_list_t* render_queue = mlxctx->render_queue;
+	while (render_queue)
+	{
+		draw_queue_t* drawcall = render_queue->content;
+		mlx_instance_t* instance =  &drawcall->image->instances[drawcall->instanceid];
+
+		if (drawcall && drawcall->image->enabled && instance->enabled)
+			mlx_draw_instance(mlx->context, drawcall->image, instance);
+		render_queue = render_queue->next;
+	}
+}
+
+//= Public =//
+
+bool mlx_loop_hook(mlx_t* mlx, void (*f)(void*), void* param)
+{
+	MLX_NONNULL(mlx);
+	MLX_NONNULL(f);
+
+	mlx_hook_t* hook;
+	if (!(hook = malloc(sizeof(mlx_hook_t))))
+		return (mlx_error(MLX_MEMFAIL));
+
+	mlx_list_t* lst;
+	if (!(lst = mlx_lstnew(hook)))
+	{
+		free(hook);
+		return (mlx_error(MLX_MEMFAIL));
+	}
+	hook->func = f;
+	hook->param = param;
+	const mlx_ctx_t	*mlxctx = mlx->context;
+	mlx_lstadd_back((mlx_list_t**)(&mlxctx->hooks), lst);
+	return (true);
+}
+
+// glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+/**
+ * In Emscripten the lood is defined differently, there the this function
+ * is passed to the while loop instead
+ */
+void mlx_loop(mlx_t* mlx)
+{
+	MLX_NONNULL(mlx);
+
+#ifdef EMSCRIPTEN
+	static double start, oldstart = 0;
+#else
+	double start, oldstart = 0;
+    while (!glfwWindowShouldClose(mlx->window))
+	{
+#endif
+		start = glfwGetTime();
+		mlx->delta_time = start - oldstart;
+		oldstart = start;
+
+		glClearColor(0.2f, 0.2f, 0.2f, 1.0f);
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+		glfwGetWindowSize(mlx->window, &(mlx->width), &(mlx->height));
+
+		if ((mlx->width > 1 || mlx->height > 1))
+			mlx_update_matrix(mlx);
+
+		mlx_exec_loop_hooks(mlx);
+		mlx_render_images(mlx);
+		mlx_flush_batch(mlx->context);
+
+		glfwSwapBuffers(mlx->window);
+		glfwPollEvents();
+#ifndef EMSCRIPTEN
+	}
+#endif
+}
+mlx_monitor.c/  0           0     0     644     1415      `
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        ::::::::            */
+/*   mlx_monitor.c                                      :+:    :+:            */
+/*                                                     +:+                    */
+/*   By: W2Wizard <main@w2wizard.dev>                 +#+                     */
+/*                                                   +#+                      */
+/*   Created: 2022/01/19 17:18:59 by W2Wizard      #+#    #+#                 */
+/*   Updated: 2022/06/27 20:02:38 by lde-la-h      ########   odam.nl         */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include "MLX42/MLX42_Int.h"
+
+//= Public =//
+
+void mlx_get_monitor_size(int32_t index, int32_t* width, int32_t* height)
+{
+	MLX_ASSERT(index >= 0, "Index out of bounds");
+	MLX_NONNULL(width);
+	MLX_NONNULL(height);
+
+	*width = 0;
+	*height = 0;
+	
+	int32_t monitor_count;
+	GLFWmonitor** monitors = glfwGetMonitors(&monitor_count);
+	if (index > monitor_count || !monitors)
+		return;
+
+	const GLFWvidmode* vidmode;
+	if ((vidmode = glfwGetVideoMode(monitors[index])))
+	{
+		*width = vidmode->width;
+		*height = vidmode->height;
+	}
+}
+
+mlx_mouse.c/    0           0     0     644     3078      `
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        ::::::::            */
+/*   mlx_mouse.c                                        :+:    :+:            */
+/*                                                     +:+                    */
+/*   By: W2Wizard <main@w2wizard.dev>                 +#+                     */
+/*                                                   +#+                      */
+/*   Created: 2022/01/01 23:20:13 by W2Wizard      #+#    #+#                 */
+/*   Updated: 2022/06/29 15:34:25 by lde-la-h      ########   odam.nl         */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include "MLX42/MLX42_Int.h"
+
+//= Private =//
+
+static void mlx_scroll_cb(GLFWwindow* window, double xoffset, double yoffset)
+{
+	const mlx_t* mlx = glfwGetWindowUserPointer(window);
+	const mlx_scroll_t scroll_hook = ((mlx_ctx_t*)mlx->context)->scroll_hook;
+
+	scroll_hook.func(xoffset, yoffset, scroll_hook.param);
+}
+
+static void mlx_mouse_cb(GLFWwindow* window, int32_t button, int32_t action, int32_t mods)
+{
+	const mlx_t* mlx = glfwGetWindowUserPointer(window);
+	const mlx_mouse_t mouse_hook = ((mlx_ctx_t*)mlx->context)->mouse_hook;
+
+	mouse_hook.func(button, action, mods, mouse_hook.param);
+}
+
+static void mlx_cursor_cb(GLFWwindow* window, double xpos, double ypos)
+{
+	const mlx_t* mlx = glfwGetWindowUserPointer(window);
+	const mlx_cursor_t cursor_hook = ((mlx_ctx_t*)mlx->context)->cursor_hook;
+
+	cursor_hook.func(xpos, ypos, cursor_hook.param);
+}
+
+//= Public =//
+
+void mlx_scroll_hook(mlx_t* mlx, mlx_scrollfunc func, void* param)
+{
+	MLX_NONNULL(mlx);
+	MLX_NONNULL(func);
+
+	mlx_ctx_t* const mlxctx = mlx->context;
+	mlxctx->scroll_hook.func = func;
+	mlxctx->scroll_hook.param = param;
+	glfwSetScrollCallback(mlx->window, mlx_scroll_cb);
+}
+
+void mlx_mouse_hook(mlx_t* mlx, mlx_mousefunc func, void* param)
+{
+	MLX_NONNULL(mlx);
+	MLX_NONNULL(func);
+
+	mlx_ctx_t* const mlxctx = mlx->context;
+	mlxctx->mouse_hook.func = func;
+	mlxctx->mouse_hook.param = param;
+	glfwSetMouseButtonCallback(mlx->window, mlx_mouse_cb);
+}
+
+void mlx_cursor_hook(mlx_t* mlx, mlx_cursorfunc func, void* param)
+{
+	MLX_NONNULL(mlx);
+	MLX_NONNULL(func);
+
+	mlx_ctx_t* const mlxctx = mlx->context;
+	mlxctx->cursor_hook.func = func;
+	mlxctx->cursor_hook.param = param;
+	glfwSetCursorPosCallback(mlx->window, mlx_cursor_cb);
+}
+
+bool mlx_is_mouse_down(mlx_t* mlx, mouse_key_t key)
+{
+	MLX_NONNULL(mlx);
+
+	return (glfwGetMouseButton(mlx->window, key) == GLFW_PRESS);
+}
+
+void mlx_set_mouse_pos(mlx_t* mlx, int32_t x, int32_t y)
+{
+	MLX_NONNULL(mlx);
+
+	glfwSetCursorPos(mlx->window, (double)x, (double)y);
+}
+
+void mlx_get_mouse_pos(mlx_t* mlx, int32_t* x, int32_t* y)
+{
+	MLX_NONNULL(mlx);
+	MLX_NONNULL(x);
+	MLX_NONNULL(y);
+
+	double xd, yd;
+	glfwGetCursorPos(mlx->window, &xd, &yd);
+	*x = (int32_t)xd;
+	*y = (int32_t)yd;
+}
+mlx_put_pixel.c/0           0     0     644     1537      `
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        ::::::::            */
+/*   mlx_put_pixel.c                                    :+:    :+:            */
+/*                                                     +:+                    */
+/*   By: W2Wizard <main@w2wizard.dev>                 +#+                     */
+/*                                                   +#+                      */
+/*   Created: 2021/12/28 03:30:13 by W2Wizard      #+#    #+#                 */
+/*   Updated: 2022/06/29 16:00:30 by lde-la-h      ########   odam.nl         */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include "MLX42/MLX42_Int.h"
+
+// BUG: Linux may experience a red hue instead due to endianness
+void mlx_draw_pixel(uint8_t* pixel, uint32_t color)
+{
+	*(pixel++) = (uint8_t)(color >> 24);
+	*(pixel++) = (uint8_t)(color >> 16);
+	*(pixel++) = (uint8_t)(color >> 8);
+	*(pixel++) = (uint8_t)(color & 0xFF);
+}
+
+//= Public =//
+
+void mlx_put_pixel(mlx_image_t* image, uint32_t x, uint32_t y, uint32_t color)
+{
+	MLX_NONNULL(image);
+	MLX_ASSERT(x < image->width, "Pixel is out of bounds");
+	MLX_ASSERT(y < image->height, "Pixel is out of bounds");
+
+	uint8_t* pixelstart = &image->pixels[(y * image->width + x) * BPP];
+	mlx_draw_pixel(pixelstart, color);
+}
+
+mlx_window.c/   0           0     0     644     3977      `
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        ::::::::            */
+/*   mlx_window.c                                       :+:    :+:            */
+/*                                                     +:+                    */
+/*   By: W2wizard <main@w2wizard.dev>                 +#+                     */
+/*                                                   +#+                      */
+/*   Created: 2022/02/08 01:14:59 by W2wizard      #+#    #+#                 */
+/*   Updated: 2022/11/22 09:06:54 by jvan-hal      ########   odam.nl         */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include "MLX42/MLX42_Int.h"
+
+//= Private =//
+
+/**
+ * Recalculate the view projection matrix, used by images for screen pos
+ * Reference: https://bit.ly/3KuHOu1 (Matrix View Projection)
+ */
+void mlx_update_matrix(const mlx_t* mlx)
+{
+	const mlx_ctx_t* mlxctx = mlx->context;
+	const float depth = mlxctx->zdepth;
+
+	/**
+	 * In case the setting to stretch the image is set, we maintain the width and height but not
+	 * the depth.
+	 */
+	const float width = mlx_settings[MLX_STRETCH_IMAGE] ? mlxctx->initialWidth : mlx->width;
+	const float height = mlx_settings[MLX_STRETCH_IMAGE] ? mlxctx->initialHeight : mlx->height;
+
+	const float matrix[16] = {
+		2.f / width, 0, 0, 0,
+		0, 2.f / -(height), 0, 0,
+		0, 0, -2.f / (depth - -depth), 0,
+		-1, -(height / -height),
+		-((depth + -depth) / (depth - -depth)), 1
+	};
+
+	glUniformMatrix4fv(glGetUniformLocation(mlxctx->shaderprogram, "ProjMatrix"), 1, GL_FALSE, matrix);
+}
+
+static void mlx_resize_callback(GLFWwindow* window, int32_t width, int32_t height)
+{
+	const mlx_t* mlx = glfwGetWindowUserPointer(window);
+	const mlx_ctx_t* mlxctx = mlx->context;
+
+	if (mlxctx->resize_hook.func)
+		mlxctx->resize_hook.func(width, height, mlxctx->resize_hook.param);
+}
+
+static void mlx_close_callback(GLFWwindow* window)
+{
+	const mlx_t* mlx = glfwGetWindowUserPointer(window);
+	const mlx_close_t close_hook = ((mlx_ctx_t*)mlx->context)->close_hook;
+
+	close_hook.func(close_hook.param);
+}
+
+//= Public =//
+
+void mlx_close_hook(mlx_t* mlx, mlx_closefunc func, void* param)
+{
+	MLX_NONNULL(mlx);
+	MLX_NONNULL(func);
+
+	mlx_ctx_t* mlxctx = mlx->context;
+	mlxctx->close_hook.func = func;
+	mlxctx->close_hook.param = param;
+	glfwSetWindowCloseCallback(mlx->window, mlx_close_callback);
+}
+
+void mlx_resize_hook(mlx_t* mlx, mlx_resizefunc func, void* param)
+{
+	MLX_NONNULL(mlx);
+	MLX_NONNULL(func);
+
+	mlx_ctx_t* mlxctx = mlx->context;
+	mlxctx->resize_hook.func = func;
+	mlxctx->resize_hook.param = param;
+	glfwSetWindowSizeCallback(mlx->window, mlx_resize_callback);
+}
+
+void mlx_set_icon(mlx_t* mlx, mlx_texture_t* image)
+{
+	MLX_NONNULL(mlx);
+	MLX_NONNULL(image);
+
+	const GLFWimage icon = {
+		.width = image->width,
+		.height = image->height,
+		.pixels = image->pixels
+	};
+
+	glfwSetWindowIcon(mlx->window, 1, &icon);
+}
+
+void mlx_set_window_pos(mlx_t* mlx, int32_t xpos, int32_t ypos)
+{
+	MLX_NONNULL(mlx);
+
+	glfwSetWindowPos(mlx->window, xpos, ypos);
+}
+
+void mlx_get_window_pos(mlx_t* mlx, int32_t* xpos, int32_t* ypos)
+{
+	MLX_NONNULL(mlx);
+	MLX_NONNULL(xpos);
+	MLX_NONNULL(ypos);
+
+	glfwGetWindowPos(mlx->window, xpos, ypos);
+}
+
+void mlx_set_window_size(mlx_t* mlx, int32_t new_width, int32_t new_height)
+{
+	MLX_NONNULL(mlx);
+
+	mlx->width = new_width;
+	mlx->height = new_height;
+	glfwSetWindowSize(mlx->window, new_width, new_height);
+}
+
+void mlx_set_window_limit(mlx_t* mlx, int32_t min_w, int32_t min_h, int32_t max_w, int32_t max_h)
+{
+	MLX_NONNULL(mlx);
+
+	glfwSetWindowSizeLimits(mlx->window, min_w, min_h, max_w, max_h);
+}
+
+void mlx_set_window_title(mlx_t* mlx, const char* title)
+{
+	MLX_NONNULL(mlx);
+	MLX_NONNULL(title);
+
+	glfwSetWindowTitle(mlx->window, title);
+}
+
